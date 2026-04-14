@@ -2,6 +2,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const Anthropic = require("@anthropic-ai/sdk");
+const WebSocket = require("ws");
 
 // Load .env file
 const envPath = path.join(__dirname, ".env");
@@ -15,8 +16,70 @@ if (fs.existsSync(envPath)) {
 const PORT = process.argv[2] || 3099;
 const CAPTURES_DIR = path.join(__dirname, "captures");
 const API_KEY = process.env.ANTHROPIC_API_KEY;
+const RTMS_WS_URL = process.env.RTMS_WS_URL || "";
 
 const anthropic = new Anthropic({ apiKey: API_KEY });
+
+// --- RTMS WebSocket Feed ---
+let rtmsLines = [];
+let rtmsConnected = false;
+let rtmsCurrentSpeaker = "";
+let rtmsReconnectTimer = null;
+
+function connectToRtms() {
+  if (!RTMS_WS_URL) return;
+  const wsUrl = RTMS_WS_URL.replace(/^http/, "ws") + "/ui-updates";
+  console.log(`[RTMS] Connecting to ${wsUrl}...`);
+
+  const ws = new WebSocket(wsUrl);
+
+  ws.on("open", () => {
+    rtmsConnected = true;
+    console.log("[RTMS] Connected to live feed");
+  });
+
+  ws.on("message", (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+
+      // Handle transcript events
+      if (msg.type === "transcript") {
+        const tData = msg.data?.data || msg.data;
+        const speaker = tData?.participant?.name || "Unknown";
+        const transcript = tData?.transcript || "";
+
+        // Only use finalized transcripts (not partials) to avoid duplicates
+        if (transcript && msg.event === "transcript.data") {
+          rtmsLines.push({
+            time: msg.timestamp || new Date().toISOString(),
+            source: "rtms",
+            speaker,
+            text: `${speaker}: ${transcript}`,
+          });
+          console.log(`[RTMS] ${speaker}: ${transcript.slice(0, 80)}`);
+        }
+      }
+
+      // Track active speaker
+      if (msg.type === "speech_on") {
+        rtmsCurrentSpeaker = msg.participant || "";
+      }
+    } catch {}
+  });
+
+  ws.on("close", () => {
+    rtmsConnected = false;
+    console.log("[RTMS] Disconnected, reconnecting in 3s...");
+    rtmsReconnectTimer = setTimeout(connectToRtms, 3000);
+  });
+
+  ws.on("error", (err) => {
+    console.error("[RTMS] Error:", err.message);
+  });
+}
+
+// Start RTMS connection if configured
+connectToRtms();
 
 // --- Auto-analysis state ---
 let lastAnalyzedLineCount = 0;
@@ -58,10 +121,22 @@ function parseSpecheSba(raw) {
 }
 
 function loadCapture() {
+  // Prefer RTMS live feed if connected and has data
+  if (rtmsLines.length > 0) {
+    return {
+      source: "rtms",
+      rtmsConnected,
+      currentSpeaker: rtmsCurrentSpeaker,
+      transcriptLines: rtmsLines,
+    };
+  }
+
+  // Fall back to file-based capture
   const file = getLatestCapture();
   if (!file) return null;
   try {
     const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+    data.source = "file";
     const hasLiveLines = (data.transcriptLines || []).some(
       (l) => l.source === "speche-iframe"
     );
@@ -106,46 +181,54 @@ function getTranscriptText(data) {
   return data.transcriptLines.map((l) => l.text || "").join("\n");
 }
 
-// --- Claude NLP Query ---
+// --- Claude NLP Query (with prompt caching) ---
 async function queryTranscript(question, transcriptText) {
   const response = await anthropic.messages.create({
     model: "claude-haiku-4-5-20241022",
     max_tokens: 1024,
-    messages: [
+    system: [
       {
-        role: "user",
-        content: `You are a legal analyst reviewing a live deposition transcript. Answer the question concisely and cite specific testimony when relevant. If the transcript doesn't contain enough information, say so.
-
-TRANSCRIPT:
-${transcriptText.slice(-15000)}
-
-QUESTION: ${question}`,
+        type: "text",
+        text: "You are a legal analyst reviewing a live deposition transcript. Answer the question concisely and cite specific testimony when relevant. If the transcript doesn't contain enough information, say so.",
       },
+      {
+        type: "text",
+        text: `TRANSCRIPT:\n${transcriptText.slice(-15000)}`,
+        cache_control: { type: "ephemeral" },
+      },
+    ],
+    messages: [
+      { role: "user", content: question },
     ],
   });
   return response.content[0].text;
 }
 
-// --- Auto-analysis for contradictions & suggested questions ---
+// --- Auto-analysis for contradictions & suggested questions (with prompt caching) ---
 async function analyzeTranscript(transcriptText, lineCount) {
   const response = await anthropic.messages.create({
     model: "claude-haiku-4-5-20241022",
     max_tokens: 1500,
-    messages: [
+    system: [
       {
-        role: "user",
-        content: `You are a senior litigation attorney reviewing a live deposition transcript in real-time. Analyze the MOST RECENT portion of testimony and provide:
+        type: "text",
+        text: `You are a senior litigation attorney reviewing a live deposition transcript in real-time. Analyze the MOST RECENT portion of testimony and provide:
 
 1. **Potential Contradictions**: Any statements that conflict with earlier testimony. Quote both statements.
 2. **Suggested Follow-up Questions**: 3-5 sharp follow-up questions an attorney should ask based on what was just said. Focus on gaps, vague answers, or areas where the witness could be pinned down.
 3. **Key Admissions**: Any significant concessions or admissions the witness made.
 4. **Credibility Notes**: Anything that affects witness credibility (hedging, inconsistency, evasiveness).
 
-Be specific. Quote the testimony. Be concise — this is a real-time tool.
-
-TRANSCRIPT (most recent ~8000 chars shown):
-${transcriptText.slice(-8000)}`,
+Be specific. Quote the testimony. Be concise — this is a real-time tool.`,
       },
+      {
+        type: "text",
+        text: `TRANSCRIPT (most recent ~8000 chars):\n${transcriptText.slice(-8000)}`,
+        cache_control: { type: "ephemeral" },
+      },
+    ],
+    messages: [
+      { role: "user", content: "Analyze this transcript now." },
     ],
   });
   return response.content[0].text;
@@ -191,6 +274,12 @@ const HTML = `<!DOCTYPE html>
   body { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; background: #0a0a0f; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
   header { background: #12121a; border-bottom: 1px solid #2a2a3a; padding: 12px 20px; display: flex; align-items: center; gap: 16px; }
   header h1 { font-size: 16px; color: #7aa2f7; font-weight: 600; }
+  .source-badge { font-size: 10px; padding: 2px 8px; border-radius: 4px; font-weight: 600; text-transform: uppercase; }
+  .source-badge.rtms { background: #1a3a2a; color: #9ece6a; border: 1px solid #9ece6a; }
+  .source-badge.file { background: #2a2a1a; color: #e0af68; border: 1px solid #e0af68; }
+  .source-badge.offline { background: #2a1a1a; color: #f7768e; border: 1px solid #f7768e; }
+  .speaker-indicator { font-size: 12px; color: #bb9af7; }
+  .speaker-indicator .name { font-weight: 600; }
   .status { font-size: 12px; color: #9ece6a; display: flex; align-items: center; gap: 6px; }
   .status .dot { width: 8px; height: 8px; background: #9ece6a; border-radius: 50%; animation: pulse 2s infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
@@ -236,8 +325,10 @@ const HTML = `<!DOCTYPE html>
 <body>
 
 <header>
-  <h1>RC Transcript Capture</h1>
+  <h1>Depo Copilot</h1>
+  <span class="source-badge offline" id="sourceBadge">offline</span>
   <div class="status"><div class="dot"></div> <span id="statusText">Connecting...</span></div>
+  <div class="speaker-indicator" id="speakerIndicator"></div>
   <div class="stats" id="stats"></div>
 </header>
 
@@ -321,7 +412,7 @@ function renderTranscript(lines) {
     let cls = 'line';
     if (/^Q\\./.test(text)) cls += ' question';
     else if (/^A\\./.test(text)) cls += ' answer';
-    else if (/^[A-Z][a-z]+ [A-Z]/.test(text) && text.includes(':')) cls += ' speaker';
+    else if (l.source === 'rtms' || (/^[A-Z][a-z]+ [A-Z]/.test(text) && text.includes(':'))) cls += ' speaker';
     return '<div class="' + cls + '"><span class="text">' + escapeHtml(text) + '</span></div>';
   }).join('');
 }
@@ -395,9 +486,18 @@ async function refresh() {
   try {
     const res = await fetch('/api/data');
     data = await res.json();
-    document.getElementById('statusText').textContent =
-      'Capturing \\u2014 ' + (data.transcriptLines?.length || 0) + ' lines';
+    const lineCount = data.transcriptLines?.length || 0;
+    const source = data.source || 'unknown';
+    const badge = document.getElementById('sourceBadge');
+    badge.textContent = source === 'rtms' ? 'RTMS Live' : source === 'file' ? 'File' : 'Offline';
+    badge.className = 'source-badge ' + (source === 'rtms' ? 'rtms' : source === 'file' ? 'file' : 'offline');
+    document.getElementById('statusText').textContent = lineCount + ' lines';
+    const speaker = data.currentSpeaker;
+    document.getElementById('speakerIndicator').innerHTML = speaker
+      ? '\\ud83c\\udfa4 <span class="name">' + speaker + '</span> speaking'
+      : '';
     document.getElementById('stats').textContent =
+      source === 'rtms' ? (data.rtmsConnected ? 'Connected' : 'Reconnecting...') :
       'Network: ' + (data.networkLog?.length || 0) +
       ' | WS: ' + (data.websocketFrames?.length || 0) +
       ' | PubNub: ' + (data.pubnubMessages?.length || 0);
@@ -443,7 +543,7 @@ const server = http.createServer(async (req, res) => {
   if (req.url === "/api/data") {
     const data = loadCapture();
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(data || { error: "No capture file found" }));
+    res.end(JSON.stringify(data || { source: "none", transcriptLines: [] }));
   } else if (req.url === "/api/query" && req.method === "POST") {
     let body = "";
     req.on("data", (chunk) => (body += chunk));
@@ -472,7 +572,8 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Dashboard running at http://localhost:${PORT}`);
-  console.log(`Reading captures from: ${CAPTURES_DIR}`);
-  console.log(`Claude AI analysis enabled (every ${ANALYSIS_INTERVAL / 1000}s)`);
+  console.log(`Depo Copilot running at http://localhost:${PORT}`);
+  console.log(`File capture fallback: ${CAPTURES_DIR}`);
+  console.log(`RTMS feed: ${RTMS_WS_URL || "not configured (set RTMS_WS_URL in .env)"}`);
+  console.log(`Claude AI analysis enabled (every ${ANALYSIS_INTERVAL / 1000}s) with prompt caching`);
 });
