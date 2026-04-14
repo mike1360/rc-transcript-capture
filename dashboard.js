@@ -184,7 +184,7 @@ function getTranscriptText(data) {
 // --- Claude NLP Query (with prompt caching) ---
 async function queryTranscript(question, transcriptText) {
   const response = await anthropic.messages.create({
-    model: "claude-haiku-4-5-20241022",
+    model: "claude-haiku-4-5-20251001",
     max_tokens: 1024,
     system: [
       {
@@ -207,7 +207,7 @@ async function queryTranscript(question, transcriptText) {
 // --- Auto-analysis for contradictions & suggested questions (with prompt caching) ---
 async function analyzeTranscript(transcriptText, lineCount) {
   const response = await anthropic.messages.create({
-    model: "claude-haiku-4-5-20241022",
+    model: "claude-haiku-4-5-20251001",
     max_tokens: 1500,
     system: [
       {
